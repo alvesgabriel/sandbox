@@ -1,0 +1,159 @@
+#!/bin/bash
+
+SCRIPT_PATH="$( cd "$(dirname "$0")" ; pwd -P )"
+BRANCH_LOCAL="$(git branch | grep \* | cut -d ' ' -f2)"
+
+# Project name
+read -r -p 'Enter with your project name: ' PROJECT_NAME
+
+# Create directory to project
+read -r -p "Do you want create project root directory? [y/N] " answer
+if [[ $answer =~ (y|Y|yes|YES) ]]; then
+    mkdir $PROJECT_NAME
+    cd $PROJECT_NAME
+fi
+
+# Check if pyenv is installed and the user want install
+if ! [ -x "$(command -v pyenv)" ]; then
+    read -r -p "pyenv is not installed, do you want install pyenv? [y/N] " answer
+    if [[ $answer =~ (y|Y|yes|YES) ]]; then
+        distro=-1
+        until [[ $distro =~ ^[0-3]$ ]]; do
+            echo "What is your Linux distribution?"
+            echo "1 - Ubuntu/Debian"
+            echo "2 - Fedora/CentOS/RHEL"
+            echo "3 - openSUSE"
+            echo "0 - ignore Linux distro"
+            read distro
+            if [[ $distro == '1' ]]; then
+                echo "Ubuntu/Debian install dependences"
+                sudo apt-get install -y make build-essential libssl-dev zlib1g-dev libbz2-dev \
+                libreadline-dev libsqlite3-dev wget curl llvm libncurses5-dev libncursesw5-dev \
+                xz-utils tk-dev libffi-dev liblzma-dev python-openssl git
+            fi
+            if [[ $distro == '2' ]]; then
+                echo "Fedora/CentOS/RHEL install dependences"
+                sudo yum install @development zlib-devel bzip2 bzip2-devel readline-devel sqlite \
+                sqlite-devel openssl-devel xz xz-devel libffi-devel findutils
+            fi
+            if [[ $distro == '3' ]]; then
+                echo "openSUSE install dependences"
+                zypper in zlib-devel bzip2 libbz2-devel libffi-devel libopenssl-devel \
+                readline-devel sqlite3 sqlite3-devel xz xz-devel
+            fi
+        done
+        echo "installing pyenv..."
+        curl -L https://github.com/pyenv/pyenv-installer/raw/master/bin/pyenv-installer | bash
+        pyenv update
+        printf 'export PATH="$HOME/.pyenv/bin:$PATH"\neval "$(pyenv init -)"\n' >> ~/.bashrc
+        pyenv install $(pyenv install --list | grep -v - | grep -v b | tail -1)
+        pyenv global pyenv versions | grep -v - | tail -1
+    fi
+fi
+
+# Install pipenv if not exists
+if ! [ -x "$(command -v pipenv)" ]; then
+    echo 'pipenv not installed'
+    echo "installing pipenv..."
+    pip install pipenv
+    printf "\nexport PIPENV_VENV_IN_PROJECT=1\n" >> ~/.bashrc
+fi
+
+# Create .gitignore file if not exists
+if ! [ -f .gitignore ]; then
+    echo "creating .gitignore file if not exists"
+    cp "$SCRIPT_PATH/gitignore-python" .gitignore
+fi
+
+# install Python dependences using pipenv
+pipenv install django dj_database_url python-decouple gunicorn psycopg2-binary dj3-cloudinary-storage
+pipenv install --dev flake8 pytest pytest-django pytest-cov coverage
+
+# Create directory to project
+read -r -p "Do you want create API? [y/N] " answer
+if [[ $answer =~ (y|Y|yes|YES) ]]; then
+    # Markdown support for the browsable API.
+    pipenv install djangorestframework markdown django-filter
+fi
+
+# Create .flake8 file
+echo "[flake8]
+max-line-length=120
+exclude=.venv,migrations" > .flake8
+# Configure flake8 to run before commit
+pipenv run flake8 --install-hook git
+git config --bool flake8.strict true
+
+# Create pytest.ini
+echo "[pytest]
+DJANGO_SETTINGS_MODULE = $PROJECT_NAME.settings" > pytest.ini
+
+# Create gitlab-ci
+cp "$SCRIPT_PATH/.gitlab-ci.yml" .gitlab-ci.yml
+
+# Generate Django project
+pipenv run django-admin startproject $PROJECT_NAME .
+
+# Create .env file
+SECRET_KEY=$(python -c 'import random; print("".join([random.choice("abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*(-_=+)") for i in range(50)]))')
+echo $SECRET_KEY
+echo "DEBUG=True
+ALLOWED_HOSTS=localhost, 127.0.0.1
+SECRET_KEY=$SECRET_KEY" > .env
+
+# Create contrib env-example file
+[ -d contrib ] || mkdir contrib
+echo "DEBUG=True
+ALLOWED_HOSTS=localhost, 127.0.0.1
+SECRET_KEY=secret key with 50 characters
+DATABASE_URL=postgres://pguser:pgpass@localhost/dbname" > contrib/env-sample
+
+
+# Configure settings.py
+# import
+sed -i "s/import os/import os\nfrom decouple import Csv, config\nfrom dj_database_url import parse as dburl/gm" $PROJECT_NAME/settings.py
+# Cloudinary storage app
+sed -i "s/'django.contrib.staticfiles',/'cloudinary_storage',\n    'django.contrib.staticfiles',\n    'cloudinary',/gm" $PROJECT_NAME/settings.py
+# SECRET_KEY
+sed -i "s/SECRET_KEY = '.*'/SECRET_KEY = config('SECRET_KEY')/gm" $PROJECT_NAME/settings.py
+# DEBUG
+sed -i "s/DEBUG = True/DEBUG = config('DEBUG', default=False, cast=bool)/gm" $PROJECT_NAME/settings.py
+# ALLOWED_HOSTS
+sed -i "s/ALLOWED_HOSTS = \[\]/ALLOWED_HOSTS = config('ALLOWED_HOSTS', default=[], cast=Csv())/gm" $PROJECT_NAME/settings.py
+# DATABASES
+sed -i "s/DATABASES = {/default_db_url = f\"sqlite:\/\/\/{os.path.join(BASE_DIR, 'db.sqlite3')}\"\nDATABASES = {/gm" $PROJECT_NAME/settings.py
+# default DB
+sed -i -e ':a' -e 'N' -e '$!ba' -e "s/'default': {\s*'ENGINE': 'django.db.backends.sqlite3',\s*'NAME': os.path.join(BASE_DIR, 'db.sqlite3'),\s*}/'default': config('DATABASE_URL', default=default_db_url, cast=dburl),/gm" $PROJECT_NAME/settings.py
+# LANGUAGE_CODE
+sed -i "s/LANGUAGE_CODE = 'en-us'/LANGUAGE_CODE = 'pt-br'/gm" $PROJECT_NAME/settings.py
+# TIME_ZONE
+sed -i "s/TIME_ZONE = 'UTC'/TIME_ZONE = 'America\/Sao_Paulo'/gm" $PROJECT_NAME/settings.py
+
+echo "
+CLOUDINARY_URL = config('CLOUDINARY_URL', default=None)
+
+if CLOUDINARY_URL:
+    STATIC_URL = '/$PROJECT_NAME/static/'
+    MEDIA_URL = '/$PROJECT_NAME/media/'
+    DEFAULT_FILE_STORAGE = 'cloudinary_storage.storage.RawMediaCloudinaryStorage'" >> $PROJECT_NAME/settings.py
+
+# Install heroku if not exists
+if ! [ -x "$(command -v heroku)" ]; then
+    curl https://cli-assets.heroku.com/install.sh | sh
+fi
+
+# Configure Heroku App
+read -r -p "Enter with your heroku app name: " HEROKU_APP_NAME
+heroku apps:create $HEROKU_APP_NAME
+echo "web: gunicorn $PROJECT_NAME.wsgi --log-file -" > Procfile
+git remote -v
+heroku config:set DISABLE_COLLECTSTATIC=1
+heroku config:set DEBUG=False
+SECRET_KEY=$(python -c 'import random; print("".join([random.choice("abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*(-_=+)") for i in range(50)]))')
+heroku config:set SECRET_KEY=$SECRET_KEY
+HOST=$(heroku info -s | grep web_url | cut -d / -f3)
+heroku config:set ALLOWED_HOSTS=$HOST
+git add .
+git commit -m ":rocket: Create automatic Django App"
+git push heroku $BRANCH_LOCAL:master -f
+heroku open
